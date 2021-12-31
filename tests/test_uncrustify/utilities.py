@@ -6,9 +6,12 @@
 #
 
 import argparse
+import concurrent.futures
 import os
+import queue
 import subprocess
 import sys
+import threading
 
 from .ansicolor import printc
 from .config import config, all_tests, FAIL_ATTRS, PASS_ATTRS, SKIP_ATTRS
@@ -120,41 +123,49 @@ def parse_args(parser):
 
 
 # -----------------------------------------------------------------------------
+def test_runner(args, tests, results, lock):
+    while not tests.empty():
+        test = tests.get()
+        try:
+            test.run(args)
+            if args.show_all:
+                outcome = 'XFAILED' if test.test_xfail else 'PASSED'
+                with lock:
+                    printc('{}: '.format(outcome), test.test_name, **PASS_ATTRS)
+            results.put('passing')
+        except UnstableFailure:
+            results.put('unstable')
+        except MismatchFailure:
+            results.put('mismatch')
+        except UnexpectedlyPassingFailure:
+            results.put('xpass')
+        except Failure:
+            results.put('failing')
+
+
+# -----------------------------------------------------------------------------
 def run_tests(tests, args, selector=None):
-    pass_count = 0
-    fail_count = 0
-    mismatch_count = 0
-    unstable_count = 0
-    unexpectedly_passing_count = 0
+    tests_queue = queue.Queue()
+    results_queue = queue.Queue()
+    lock = threading.Lock()
 
     for test in tests:
         if selector is not None and not selector.test(test.test_name):
             if args.show_all:
                 printc("SKIPPED: ", test.test_name, **SKIP_ATTRS)
-            continue
+        else:
+            tests_queue.put(test)
 
-        try:
-            test.run(args)
-            if args.show_all:
-                outcome = 'XFAILED' if test.test_xfail else 'PASSED'
-                printc('{}: '.format(outcome), test.test_name, **PASS_ATTRS)
-            pass_count += 1
-        except UnstableFailure:
-            unstable_count += 1
-        except MismatchFailure:
-            mismatch_count += 1
-        except UnexpectedlyPassingFailure:
-            unexpectedly_passing_count += 1
-        except Failure:
-            fail_count += 1
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        for i in range(4):
+            executor.submit(test_runner, args, tests_queue, results_queue, lock)
 
-    return {
-        'passing': pass_count,
-        'failing': fail_count,
-        'mismatch': mismatch_count,
-        'unstable': unstable_count,
-        'xpass': unexpectedly_passing_count
-    }
+    counts = {'passing':0, 'failing':0, 'mismatch':0, 'unstable':0, 'xpass':0}
+    while not results_queue.empty():
+        r = results_queue.get()
+        counts[r] += 1
+
+    return counts
 
 
 # -----------------------------------------------------------------------------
